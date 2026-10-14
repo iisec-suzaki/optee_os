@@ -43,6 +43,21 @@ was closed does not unwrap afterwards, so generate the key on the closed
 device. Without the CAAM ECC driver the two commands return
 `TEE_ERROR_NOT_SUPPORTED` and a serialized black key cannot be used.
 
+## Platform claims
+
+With `CFG_VERAISON_ATTESTATION_PTA_PLATFORM_CLAIMS=y`, supported on the
+i.MX 8M family with `CFG_IMX_OCOTP=y`, the security lifecycle of the
+evidence comes from the fuses NXP's U-Boot consults for the HAB secure boot:
+
+| SRK hash fuses | SEC_CONFIG | FIELD_RETURN | Lifecycle |
+|---|---|---|---|
+| not programmed | any | any | `0x1000`, assembly and test |
+| programmed | open | any | `0x2000`, PSA RoT provisioning |
+| programmed | closed | not set | `0x3000`, secured |
+| programmed | closed | set | `0x6000`, decommissioned |
+
+Without the option the lifecycle is the fixed value `0x3000`.
+
 ## Known Limitations
 
 1. **PSA Semantics Limitations:** Although this PTA reuses the PSA token format, many of the relevant properties required by the PSA Security Model (SM) are not met. This can impact the effectiveness and security assumptions typically expected from PSA-based attestation.
