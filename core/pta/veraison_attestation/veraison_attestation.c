@@ -3,17 +3,27 @@
  * Copyright (C) 2024, Institute of Information Security (IISEC)
  */
 
-#include <base64.h>
+#include <config.h>
 #include <crypto/crypto.h>
 #include <drivers/caam_extension.h>
+#include <kernel/early_ta.h>
+#include <kernel/linker.h>
 #include <kernel/pseudo_ta.h>
+#include <kernel/ts_manager.h>
+#include <kernel/user_ta.h>
 #include <mempool.h>
 #include <pta_veraison_attestation.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ta_pub_key.h>
+#include <tee/uuid.h>
+#include <utee_defines.h>
+#include <util.h>
 
 #include "cbor.h"
 #include "hash.h"
+#include "platform.h"
 #include "sign.h"
 
 #define PTA_NAME "veraison_attestation.pta"
@@ -23,10 +33,10 @@
 #define TEE_SHA256_HASH_SIZE 32
 
 #define EAT_PROFILE "http://arm.com/psa/2.0.0"
-#define CLIENT_ID 1
 #define LIFECYCLE 12288
-#define MEASURMENT_TYPE "PRoT"
-#define SIGNER_ID_LEN 32
+#define TA_MEASUREMENT_TYPE "ARoT"
+#define TEE_MEASUREMENT_TYPE "PRoT"
+#define TEE_VERSION_MAX_LEN 32
 #define INSTANCE_ID_LEN 33
 
 #define PUBKEY_COORD_SIZE 32
@@ -34,14 +44,135 @@
 /* The private key is at least the plain P-256 scalar */
 #define KEY_PARAM_MIN_SIZE (KEY_PARAM_HEADER_SIZE + PUBKEY_COORD_SIZE)
 
-/* clang-format off */
-#define SIGNER_ID {                                                \
-		0xac, 0xbb, 0x11, 0xc7, 0xe4, 0xda, 0x21, 0x72,    \
-		0x05, 0x52, 0x3c, 0xe4, 0xce, 0x1a, 0x24, 0x5a,    \
-		0xe1, 0xa2, 0x39, 0xae, 0x3c, 0x6b, 0xfd, 0x9e,    \
-		0x78, 0x71, 0xf7, 0xe5, 0xd8, 0xba, 0xe8, 0x6b     \
-	}
-/* clang-format on */
+/* Signer of the boot images when the platform does not say */
+static const uint8_t test_boot_signer_id[SIGNER_ID_LEN] = {
+	0xac, 0xbb, 0x11, 0xc7, 0xe4, 0xda, 0x21, 0x72,
+	0x05, 0x52, 0x3c, 0xe4, 0xce, 0x1a, 0x24, 0x5a,
+	0xe1, 0xa2, 0x39, 0xae, 0x3c, 0x6b, 0xfd, 0x9e,
+	0x78, 0x71, 0xf7, 0xe5, 0xd8, 0xba, 0xe8, 0x6b,
+};
+
+static bool is_early_ta(const TEE_UUID *uuid)
+{
+	const struct embedded_ts *ta = NULL;
+
+	if (IS_ENABLED(CFG_EARLY_TA))
+		for_each_early_ta(ta)
+			if (!memcmp(&ta->uuid, uuid, sizeof(*uuid)))
+				return true;
+
+	return false;
+}
+
+/* The hash of the key that signs the boot images, the core among them */
+static TEE_Result get_boot_signer_id(uint8_t signer_id[SIGNER_ID_LEN])
+{
+	if (IS_ENABLED(CFG_VERAISON_ATTESTATION_PTA_PLATFORM_CLAIMS))
+		return platform_get_boot_signer_id(signer_id);
+
+	memcpy(signer_id, test_boot_signer_id, SIGNER_ID_LEN);
+
+	return TEE_SUCCESS;
+}
+
+/*
+ * The SHA-256 of the TA root public key the core verifies TAs against,
+ * over the big-endian modulus followed by the big-endian 32-bit exponent
+ */
+static TEE_Result get_ta_root_key_id(uint8_t signer_id[SIGNER_ID_LEN])
+{
+	uint32_t e = TEE_U32_TO_BIG_ENDIAN(ta_pub_key_exponent);
+	TEE_Result res = TEE_SUCCESS;
+	void *ctx = NULL;
+
+	res = crypto_hash_alloc_ctx(&ctx, TEE_ALG_SHA256);
+	if (res != TEE_SUCCESS)
+		return res;
+	res = crypto_hash_init(ctx);
+	if (res != TEE_SUCCESS)
+		goto out;
+	res = crypto_hash_update(ctx, ta_pub_key_modulus,
+				 ta_pub_key_modulus_size);
+	if (res != TEE_SUCCESS)
+		goto out;
+	res = crypto_hash_update(ctx, (uint8_t *)&e, sizeof(e));
+	if (res != TEE_SUCCESS)
+		goto out;
+	res = crypto_hash_final(ctx, signer_id, SIGNER_ID_LEN);
+out:
+	crypto_hash_free_ctx(ctx);
+
+	return res;
+}
+
+/*
+ * Who vouches for the calling TA: a TA loaded from the REE file system or
+ * the secure storage is verified against the TA root public key built into
+ * the core, so that key is its signer. An early TA is part of the core
+ * image and carries no signature of its own, so its signer is whoever
+ * signed the core.
+ */
+static TEE_Result get_ta_signer_id(const TEE_UUID *uuid,
+				   uint8_t signer_id[SIGNER_ID_LEN])
+{
+	if (is_early_ta(uuid))
+		return get_boot_signer_id(signer_id);
+
+	return get_ta_root_key_id(signer_id);
+}
+
+/*
+ * The PSA client-id names the caller the evidence is about. Derive it from
+ * the UUID of the calling TA: the SHA-256 of the UUID in its RFC 4122 octet
+ * form, reduced to 1..INT32_MAX, the value range the PSA token reserves for
+ * callers in the secure world.
+ */
+static TEE_Result get_client_id(const TEE_UUID *uuid, int *client_id)
+{
+	uint8_t hash[TEE_SHA256_HASH_SIZE] = { };
+	uint8_t octets[sizeof(TEE_UUID)] = { };
+	TEE_Result res = TEE_SUCCESS;
+	void *ctx = NULL;
+	uint32_t v = 0;
+
+	tee_uuid_to_octets(octets, uuid);
+
+	res = crypto_hash_alloc_ctx(&ctx, TEE_ALG_SHA256);
+	if (res != TEE_SUCCESS)
+		return res;
+	res = crypto_hash_init(ctx);
+	if (res != TEE_SUCCESS)
+		goto out;
+	res = crypto_hash_update(ctx, octets, sizeof(octets));
+	if (res != TEE_SUCCESS)
+		goto out;
+	res = crypto_hash_final(ctx, hash, sizeof(hash));
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	v = ((uint32_t)hash[28] << 24) | ((uint32_t)hash[29] << 16) |
+	    ((uint32_t)hash[30] << 8) | hash[31];
+	*client_id = 1 + v % INT32_MAX;
+out:
+	crypto_hash_free_ctx(ctx);
+
+	return res;
+}
+
+/*
+ * Version of the TEE core: the first word of the core version string, that
+ * is TEE_IMPL_VERSION (for instance "4.6.0" or "4.6.0-12-gabcdef0-dev"),
+ * without the compiler, build count and date that follow it.
+ */
+static void get_tee_version(char *out, size_t out_len)
+{
+	size_t n = 0;
+
+	while (n < out_len - 1 && core_v_str[n] && core_v_str[n] != ' ')
+		n++;
+	memcpy(out, core_v_str, n);
+	out[n] = '\0';
+}
 
 static TEE_Result cmd_get_cbor_evidence(uint32_t param_types,
 					TEE_Param params[TEE_NUM_PARAMS])
@@ -52,6 +183,7 @@ static TEE_Result cmd_get_cbor_evidence(uint32_t param_types,
 	size_t *output_buffer_len = &params[1].memref.size;
 	const uint8_t *psa_implementation_id = params[2].memref.buffer;
 	const size_t psa_implementation_id_len = params[2].memref.size;
+	struct ts_session *s = ts_get_calling_session();
 	const uint8_t *private_key = NULL;
 	size_t private_key_len = 0;
 	const uint8_t *public_key_x = NULL;
@@ -61,15 +193,32 @@ static TEE_Result cmd_get_cbor_evidence(uint32_t param_types,
 	TEE_Result status = TEE_SUCCESS;
 
 	const char eat_profile[] = EAT_PROFILE;
-	const int psa_client_id = CLIENT_ID;
-	const int psa_security_lifecycle = LIFECYCLE;
-	const char measurement_type[] = MEASURMENT_TYPE;
-	const uint8_t signer_id[SIGNER_ID_LEN] = SIGNER_ID;
+	int psa_client_id = 0;
+	int psa_security_lifecycle = LIFECYCLE;
+	uint8_t ta_signer_id[SIGNER_ID_LEN] = { 0 };
+	uint8_t boot_signer_id[SIGNER_ID_LEN] = { 0 };
 	uint8_t psa_instance_id[INSTANCE_ID_LEN] = { 0 };
 
-	uint8_t measurement_value[TEE_SHA256_HASH_SIZE] = { 0 };
-	size_t b64_measurement_value_len = TEE_SHA256_HASH_SIZE * 2;
-	char b64_measurement_value[TEE_SHA256_HASH_SIZE * 2] = { 0 };
+	uint8_t ta_measurement[TEE_SHA256_HASH_SIZE] = { 0 };
+	uint8_t tee_measurement[TEE_SHA256_HASH_SIZE] = { 0 };
+	char tee_version[TEE_VERSION_MAX_LEN] = { 0 };
+	struct psa_sw_component components[2] = {
+		{
+			.measurement_type = TA_MEASUREMENT_TYPE,
+			.measurement_value = ta_measurement,
+			.measurement_value_len = sizeof(ta_measurement),
+			.signer_id = ta_signer_id,
+			.signer_id_len = sizeof(ta_signer_id),
+		},
+		{
+			.measurement_type = TEE_MEASUREMENT_TYPE,
+			.measurement_value = tee_measurement,
+			.measurement_value_len = sizeof(tee_measurement),
+			.version = tee_version,
+			.signer_id = boot_signer_id,
+			.signer_id_len = sizeof(boot_signer_id),
+		},
+	};
 
 	UsefulBufC ubc_cbor_evidence = { NULL, 0 };
 	UsefulBufC ubc_cose_evidence = { NULL, 0 };
@@ -89,6 +238,13 @@ static TEE_Result cmd_get_cbor_evidence(uint32_t param_types,
 
 	if (!output_buffer && *output_buffer_len)
 		return TEE_ERROR_BAD_PARAMETERS;
+
+	if (!s || !is_user_ta_ctx(s->ctx))
+		return TEE_ERROR_ACCESS_DENIED;
+
+	status = get_client_id(&s->ctx->uuid, &psa_client_id);
+	if (status != TEE_SUCCESS)
+		return status;
 
 	/*
 	 * The signing key, when the caller supplies one: the public key
@@ -118,19 +274,30 @@ static TEE_Result cmd_get_cbor_evidence(uint32_t param_types,
 	if (status != TEE_SUCCESS)
 		return status;
 
-	/* Calculate measurement hash of memory */
-	status = get_hash_ta_memory(measurement_value);
+	/* Measure the calling TA and the TEE core */
+	status = get_hash_ta_memory(ta_measurement);
+	if (status != TEE_SUCCESS)
+		return status;
+	status = get_hash_tee_memory(tee_measurement);
+	if (status != TEE_SUCCESS)
+		return status;
+	get_tee_version(tee_version, sizeof(tee_version));
+	DHEXDUMP(ta_measurement, sizeof(ta_measurement));
+	DHEXDUMP(tee_measurement, sizeof(tee_measurement));
+	DMSG("TEE version: %s", tee_version);
+
+	status = get_ta_signer_id(&s->ctx->uuid, ta_signer_id);
+	if (status != TEE_SUCCESS)
+		return status;
+	status = get_boot_signer_id(boot_signer_id);
 	if (status != TEE_SUCCESS)
 		return status;
 
-	/* Encode measurement_value to base64 */
-	if (!base64_enc(measurement_value, TEE_SHA256_HASH_SIZE,
-			b64_measurement_value,
-			&b64_measurement_value_len)) {
-		DMSG("Failed to encode measurement_value to base64");
-		return TEE_ERROR_GENERIC;
+	if (IS_ENABLED(CFG_VERAISON_ATTESTATION_PTA_PLATFORM_CLAIMS)) {
+		status = platform_get_lifecycle(&psa_security_lifecycle);
+		if (status != TEE_SUCCESS)
+			return status;
 	}
-	DMSG("b64_measurement_value: %s", b64_measurement_value);
 
 	/* Encode evidence to CBOR */
 	ubc_cbor_evidence = generate_cbor_evidence(eat_profile,
@@ -138,15 +305,12 @@ static TEE_Result cmd_get_cbor_evidence(uint32_t param_types,
 						   psa_security_lifecycle,
 						   psa_implementation_id,
 						   psa_implementation_id_len,
-						   measurement_type,
-						   signer_id,
-						   SIGNER_ID_LEN,
+						   components,
+						   ARRAY_SIZE(components),
 						   psa_instance_id,
 						   INSTANCE_ID_LEN,
 						   nonce,
-						   nonce_sz,
-						   measurement_value,
-						   TEE_SHA256_HASH_SIZE);
+						   nonce_sz);
 	if (UsefulBuf_IsNULLC(ubc_cbor_evidence)) {
 		DMSG("Failed to encode evidence to CBOR");
 		return TEE_ERROR_GENERIC;
